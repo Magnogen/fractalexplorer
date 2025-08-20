@@ -1,40 +1,79 @@
 on('load', () => {
   // --- Worker creation utility ---
   const createWorker = (fn) => {
-    const blob = new Blob([`(${fn})()`], { type: "application/javascript" });
+    const blob = new Blob([`(${fn})()`], { type: 'application/javascript' });
     const url = URL.createObjectURL(blob);
     return new Worker(url);
   };
 
   // --- Worker: Mandelbrot tile renderer ---
   const workerFn = () => {
+    const mandelbrot = (cx, cy, iterations) => {
+      let zx = 0, zy = 0, zx2 = 0, zy2 = 0, i = 0;
+      while (zx * zx + zy * zy < 8 && i < iterations) {
+        // zx = Math.abs(zx);
+        // zy = Math.abs(zy);
+        zy = 2 * zx * zy + cy;
+        zx = zx2 - zy2 + cx;
+        zx2 = zx * zx;
+        zy2 = zy * zy;
+        i++;
+      }
+      if (i == iterations) return { escaped: false, color: [0,0, 0] };
+
+      const smoothI = i - Math.log2(Math.log2(zx*zx + zy*zy)) + 4.0;
+
+      const r = Math.cos((smoothI * 5) / 255) * 255;
+      const g = Math.cos((smoothI * 9) / 255) * 255;
+      const b = Math.cos((smoothI * 13) / 255) * 255;
+
+      return { escaped: true, iterations: i, color: [r, g, b] };
+    };
+    
     self.onmessage = (e) => {
-      const { width, height, iterations, x0, y0, dx, dy, tx, ty } = e.data;
+      const { width, height, iterations, x, y, dx, dy, tx, ty } = e.data;
       const result = new Uint8ClampedArray(4 * width * height);
 
+      const AA = 4;
+      const offsets = [];
+      for (let i = 0; i < AA; i++) {
+        for (let j = 0; j < AA; j++) {
+          offsets.push([(i + 0.5) / AA, (j + 0.5) / AA]);
+        }
+      }
+      
       for (let py = 0; py < height; py++) {
         for (let px = 0; px < width; px++) {
-          const cx = x0 + (px / width) * dx;
-          const cy = y0 + (py / height) * dy;
-          let zx = 0, zy = 0, i = 0;
+          const cx = x + (px / width) * dx;
+          const cy = y + (py / height) * dy;
+          
+          const base = mandelbrot(cx, cy, iterations);
+          const needsRefine = base.iterations > iterations / 8;
+          let finalColor = base.color;
+          
+          if (base.escaped && needsRefine) {
+            let acc = [0, 0, 0];
 
-          while (zx * zx + zy * zy < 5 && i < iterations) {
-            let tmp = zx * zx - zy * zy + cx;
-            zy = 2 * zx * zy + cy;
-            zx = tmp;
-            i++;
+            for (const [ox, oy] of offsets) {
+              const subCx = x + ((px + ox) / width) * dx;
+              const subCy = y + ((py + oy) / height) * dy;
+
+              const sub = mandelbrot(subCx, subCy, iterations);
+
+              acc[0] += sub.color[0];
+              acc[1] += sub.color[1];
+              acc[2] += sub.color[2];
+            }
+
+            finalColor = acc.map((v) => v / (offsets.length));
           }
           
-          const smoothI = i - Math.log2(Math.log2(zx*zx + zy*zy)) + 4.0;
-          const index = py * width + px;
+          const index = 4 * (py * width + px);
+          result[index + 0] = finalColor[0];
+          result[index + 1] = finalColor[1];
+          result[index + 2] = finalColor[2];
           
-          result[4 * index + 3] = 255;
-          
-          if (i == iterations) continue;
-          
-          result[4 * index + 0] = Math.cos((smoothI * 5)/255)*255;
-          result[4 * index + 1] = Math.cos((smoothI * 9)/255)*255;
-          result[4 * index + 2] = Math.cos((smoothI * 13)/255)*255;
+          result[index + 3] = 255;
         }
       }
 
@@ -66,17 +105,11 @@ on('load', () => {
   // --- Job queue management ---
   let jobQueue = [];
   
-  function enqueue(job) {
-    jobQueue.push(job);
-    processNext();
-  }
-  
   function processNext() {
-    if (jobQueue.length === 0) return;
     workers.forEach((worker) => {
+      if (jobQueue.length == 0) return;
       if (worker.isBusy) return;
       const job = jobQueue.shift();
-      if (!job) return;
       worker.isBusy = true;
       worker.worker.postMessage(job);
     });
@@ -99,7 +132,7 @@ on('load', () => {
     };
   });
   
-  function getIterations(view, initialWidth) {
+  const getIterations = (view, initialWidth) => {
     const zoom = initialWidth / view.w;
     const base = 256;
     const factor = 128;
@@ -107,36 +140,45 @@ on('load', () => {
   }
 
   // --- Clear + refill queue ---
-  function render() {
-    jobQueue = [];
-    working = false;
-
+  const render = () => {
     const iterations = getIterations(view, 3.5);
-
-    for (let ty = 0; ty < tilesY; ty++) {
-      for (let tx = 0; tx < tilesX; tx++) {
-        const x0 = view.x + (tx * frameSize / c.width) * view.w;
-        const y0 = view.y + (ty * frameSize / c.height) * view.h;
-        const dx = (frameSize / c.width) * view.w;
-        const dy = (frameSize / c.height) * view.h;
-
-        enqueue({
-          width: frameSize,
-          height: frameSize,
-          iterations,  // dynamic now!
-          x0, y0, dx, dy,
-          tx, ty
-        });
-      }
-    }
+    jobQueue = (Array.from({ length: tilesY * tilesX }, (_, i) => {
+      const tx = i % tilesX, ty = (i / tilesX) | 0;
+      
+      const x = view.x + (tx * frameSize / c.width) * view.w;
+      const y = view.y + (ty * frameSize / c.height) * view.h;
+      
+      const dx = (frameSize / c.width) * view.w;
+      const dy = (frameSize / c.height) * view.h;
+      
+      return { width: frameSize, height: frameSize, iterations, x, y, dx, dy, tx, ty };
+    }));
+    processNext();
   }
-
 
   // --- FSM for interaction ---
   let panStart = null;
+  
+  const finishPan = (ev) => {
+    const dxPx = ev.clientX - panStart.x;
+    const dyPx = ev.clientY - panStart.y;
+    
+    view.x = panStart.view.x - (dxPx / c.width) * view.w;
+    view.y = panStart.view.y - (dyPx / c.height) * view.h;
+    
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, c.width, c.height);
+    ctx.translate(dxPx, dyPx);
+    ctx.drawImage(bufferCanvas, 0, 0);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    bufferCtx.clearRect(0, 0, c.width, c.height);
+    bufferCtx.drawImage(c, 0, 0);
+    
+    render();
+    return 'idle';
+  };
 
   const fsm = FSM({
-    initially: 'idle',
     states: {
       idle: {
         mousedown: (ev) => {
@@ -146,7 +188,7 @@ on('load', () => {
         wheel: (ev) => {
           ev.preventDefault();
 
-          const zoomFactor = ev.deltaY < 0 ? 0.8 : 1.25;
+          const zoomFactor = ev.deltaY < 0 ? 9/10 : 10/9;
           const mouseX = ev.offsetX;
           const mouseY = ev.offsetY;
 
@@ -160,7 +202,19 @@ on('load', () => {
           view.y = cy - ((mouseY / c.height) * newH);
           view.w = newW;
           view.h = newH;
+          
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.clearRect(0, 0, c.width, c.height);
 
+          ctx.translate(mouseX, mouseY);
+          ctx.scale(1/zoomFactor, 1/zoomFactor);
+          ctx.translate(-mouseX, -mouseY);
+
+          ctx.drawImage(bufferCanvas, 0, 0);
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          bufferCtx.clearRect(0, 0, c.width, c.height);
+          bufferCtx.drawImage(c, 0, 0);
+          
           render();
         }
       },
@@ -174,42 +228,18 @@ on('load', () => {
           ctx.translate(dxPx, dyPx);
           ctx.drawImage(bufferCanvas, 0, 0);
         },
-        mouseup: (ev) => {
-          const dxPx = ev.clientX - panStart.x;
-          const dyPx = ev.clientY - panStart.y;
-
-          view.x = panStart.view.x - (dxPx / c.width) * view.w;
-          view.y = panStart.view.y - (dyPx / c.height) * view.h;
-
-          ctx.setTransform(1, 0, 0, 1, 0, 0);
-          bufferCtx.clearRect(0, 0, c.width, c.height);
-          render();
-
-          return 'idle';
-        },
-        mouseleave: (ev) => {
-          const dxPx = ev.clientX - panStart.x;
-          const dyPx = ev.clientY - panStart.y;
-
-          view.x = panStart.view.x - (dxPx / c.width) * view.w;
-          view.y = panStart.view.y - (dyPx / c.height) * view.h;
-
-          ctx.setTransform(1, 0, 0, 1, 0, 0);
-          bufferCtx.clearRect(0, 0, c.width, c.height);
-          render();
-
-          return 'idle';
-        }
+        mouseup: finishPan,
+        mouseleave: finishPan
       }
     }
   });
 
   // --- Event bindings ---
-  c.addEventListener('mousedown', fsm.event('mousedown'));
-  c.addEventListener('mousemove', fsm.event('mousemove'));
-  c.addEventListener('mouseup', fsm.event('mouseup'));
+  c.addEventListener('mousedown',  fsm.event('mousedown'));
+  c.addEventListener('mousemove',  fsm.event('mousemove'));
+  c.addEventListener('mouseup',    fsm.event('mouseup'));
   c.addEventListener('mouseleave', fsm.event('mouseleave'));
-  c.addEventListener('wheel', fsm.event('wheel'));
+  c.addEventListener('wheel',      fsm.event('wheel'));
 
   // First render
   render();
