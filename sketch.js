@@ -1,33 +1,32 @@
 on('load', () => {
-  // --- Worker creation utility ---
   const createWorker = (fn) => {
     const blob = new Blob([`(${fn})()`], { type: 'application/javascript' });
     const url = URL.createObjectURL(blob);
     return new Worker(url);
   };
 
-  // --- Worker: Mandelbrot tile renderer ---
   const workerFn = () => {
     const mandelbrot = (cx, cy, iterations) => {
-      let zx = 0, zy = 0, zx2 = 0, zy2 = 0, i = 0;
-      while (zx * zx + zy * zy < 64 && i < iterations) {
-        // zx = Math.abs(zx);
-        // zy = Math.abs(zy);
-        zy = 2 * zx * zy + cy;
-        zx = zx2 - zy2 + cx;
-        zx2 = zx * zx;
-        zy2 = zy * zy;
+      let zx = 0, zy = 0, i = 0;
+      while (zx*zx + zy*zy < 64 && i < iterations) {
+        const [x, y] = [zx, zy];
+        zx = x*x - y*y + cx;
+        zy = 2*x*y + cy;
         i++;
       }
       if (i == iterations) return { escaped: false, color: [0, 0, 0] };
 
       const smoothI = i - Math.log2(Math.log2(zx*zx + zy*zy)) + 4.0;
-      
-      const saturation = 0.75;
-      
-      const r = saturation*Math.sin(smoothI + 2*Math.PI*0/3)/2 + 1/2;
-      const g = saturation*Math.sin(smoothI + 2*Math.PI*1/3)/2 + 1/2;
-      const b = saturation*Math.sin(smoothI + 2*Math.PI*2/3)/2 + 1/2;
+
+      const saturation = 2;
+
+      // const r = saturation*Math.sin(smoothI + 2*Math.PI*0/3)/2 + 1/2;
+      // const g = saturation*Math.sin(smoothI + 2*Math.PI*1/3)/2 + 1/2;
+      // const b = saturation*Math.sin(smoothI + 2*Math.PI*2/3)/2 + 1/2;
+
+      const r = saturation*Math.sin(smoothI*2/100)/2 + 0/2;
+      const g = saturation*Math.sin(smoothI*3/100)/2 + 0/2;
+      const b = saturation*Math.sin(smoothI*5/100)/2 + 0/2;
 
       return { escaped: true, iterations: i, color: [r*255, g*255, b*255] };
     };
@@ -40,7 +39,7 @@ on('load', () => {
       const offsets = [];
       for (let i = 0; i < AA; i++) {
         for (let j = 0; j < AA; j++) {
-          offsets.push([(i + 0.5) / AA, (j + 0.5) / AA]);
+          offsets.push([i / AA, j / AA]);
         }
       }
       
@@ -83,28 +82,29 @@ on('load', () => {
     };
   };
 
-  const numWorkers = navigator.hardwareConcurrency || 4; // use # of CPU cores if available
+  const numWorkers = navigator.hardwareConcurrency || 4;
   const workers = Array.from({ length: numWorkers }, () => ({ isBusy: false, worker: createWorker(workerFn) }));
 
-  // --- Canvas setup ---
   const c = $('canvas');
   const ctx = c.getContext('2d');
-  c.width = innerWidth;
-  c.height = innerHeight;
+  const bb = c.getBoundingClientRect();
+  c.width = bb.width;
+  c.height = bb.height;
 
   const frameSize = 64;
   const tilesX = Math.ceil(c.width / frameSize);
   const tilesY = Math.ceil(c.height / frameSize);
 
-  // Viewport in fractal space
   let view = {
-    x: -2.5,
-    y: -1.5,
-    w: 3.5,
-    h: 3.5 * innerHeight/innerWidth,
+    x: 0,
+    y: 0,
+    w: 4,
+    h: 4 * c.height/c.width,
   };
   
-  // --- Job queue management ---
+  view.x = -0.5 - view.w/2;
+  view.y =  0.0 - view.h/2;
+  
   let jobQueue = [];
   
   function processNext() {
@@ -117,7 +117,6 @@ on('load', () => {
     });
   }
   
-  // Store full rendered fractal in a buffer canvas
   const bufferCanvas = document.createElement('canvas');
   bufferCanvas.width = c.width;
   bufferCanvas.height = c.height;
@@ -130,7 +129,7 @@ on('load', () => {
       const imageData = new ImageData(new Uint8ClampedArray(buffer), frameSize);
       bufferCtx.putImageData(imageData, tx * frameSize, ty * frameSize);
       ctx.drawImage(bufferCanvas, 0, 0);
-      processNext(); // assign next job
+      processNext();
     };
   });
   
@@ -141,24 +140,30 @@ on('load', () => {
     return Math.max(base, Math.floor(base + factor * Math.log2(zoom)));
   }
 
-  // --- Clear + refill queue ---
   const render = () => {
     const iterations = getIterations(view, 3.5);
-    jobQueue = (Array.from({ length: tilesY * tilesX }, (_, i) => {
+    jobQueue = Array.from({ length: tilesY * tilesX }, (_, i) => {
       const tx = i % tilesX, ty = (i / tilesX) | 0;
-      
+
       const x = view.x + (tx * frameSize / c.width) * view.w;
       const y = view.y + (ty * frameSize / c.height) * view.h;
-      
+
       const dx = (frameSize / c.width) * view.w;
       const dy = (frameSize / c.height) * view.h;
-      
-      return { width: frameSize, height: frameSize, iterations, x, y, dx, dy, tx, ty };
-    }));
-    processNext();
-  }
 
-  // --- FSM for interaction ---
+      const cx = tx * frameSize + frameSize / 2;
+      const cy = ty * frameSize + frameSize / 2;
+      const dist2 = (cx - lastMouseX) ** 2 + (cy - lastMouseY) ** 2;
+
+      return { width: frameSize, height: frameSize, iterations, x, y, dx, dy, tx, ty, dist2 };
+    });
+
+    // Sort by closeness to mouse
+    jobQueue.sort((a, b) => a.dist2 - b.dist2);
+
+    processNext();
+  };
+
   let panStart = null;
   let pinchStart = null;
   
@@ -283,7 +288,7 @@ on('load', () => {
             return finishPan({
               clientX: t.clientX,
               clientY: t.clientY,
-              preventDefault: () => {} // no-op, already handled
+              preventDefault: () => {}
             });
           }
         },
@@ -304,7 +309,6 @@ on('load', () => {
 
           const zoomFactor = pinchStart.dist / dist;
 
-          // same math as wheel zoom
           const mouseX = pinchStart.cx;
           const mouseY = pinchStart.cy;
           const newW = pinchStart.view.w * zoomFactor;
@@ -325,13 +329,13 @@ on('load', () => {
         },
         touchend: (ev) => {
           ev.preventDefault();
-          if (ev.touches.length === 1) {
+          if (ev.touches.length == 1) {
             const t = ev.touches[0];
             panStart = { x: t.clientX, y: t.clientY, view: { ...view } };
             render();
             return 'panning';
           }
-          if (ev.touches.length === 0) {
+          if (ev.touches.length == 0) {
             render();
             return 'idle';
           }
@@ -340,19 +344,25 @@ on('load', () => {
     }
   });
 
-  // --- Event bindings ---
-  c.addEventListener('mousedown',   fsm.event('mousedown'));
-  c.addEventListener('mousemove',   fsm.event('mousemove'));
-  c.addEventListener('mouseup',     fsm.event('mouseup'));
-  c.addEventListener('mouseleave',  fsm.event('mouseleave'));
-  c.addEventListener('wheel',       fsm.event('wheel'));
+  c.on('mousedown',   fsm.event('mousedown'));
+  c.on('mousemove',   fsm.event('mousemove'));
+  c.on('mouseup',     fsm.event('mouseup'));
+  c.on('mouseleave',  fsm.event('mouseleave'));
+  c.on('wheel',       fsm.event('wheel'));
   
-  c.addEventListener('touchstart',  fsm.event('touchstart'), { passive: false });
-  c.addEventListener('touchmove',   fsm.event('touchmove'),  { passive: false });
-  c.addEventListener('touchend',    fsm.event('touchend'),   { passive: false });
-  c.addEventListener('touchcancel', fsm.event('touchend'),   { passive: false });
+  c.on('touchstart',  fsm.event('touchstart'), { passive: false });
+  c.on('touchmove',   fsm.event('touchmove'),  { passive: false });
+  c.on('touchend',    fsm.event('touchend'),   { passive: false });
+  c.on('touchcancel', fsm.event('touchend'),   { passive: false });
+  
+  let lastMouseX = c.width / 2;
+  let lastMouseY = c.height / 2;
 
+  // Track mouse position
+  c.on('mousemove', (ev) => {
+    lastMouseX = ev.offsetX;
+    lastMouseY = ev.offsetY;
+  });
 
-  // First render
   render();
 });
